@@ -33,5 +33,5 @@ To verify an archive, download the corresponding `SHA256SUMS`, `SHA384SUMS`, or 
 
 ## Disclaimer
 
-Binaries are built directly from unmodified OpenSSL source releases using the options shown in the workflow file. No warranty is provided;
-verify binaries are suitable for your use case before relying on them, especially in security-sensitive contexts.
+Binaries are built directly from unmodified OpenSSL source releases using the options shown in the workflow file.
+No warranty is provided; verify binaries are suitable for your use case before relying on them, especially in security-sensitive contexts.
