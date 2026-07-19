@@ -205,7 +205,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          "${{ github.workspace }}/${DIST_NAME}/bin/openssl" version
+          INSTALL_DIR="${{ github.workspace }}/${DIST_NAME}"
+          export LD_LIBRARY_PATH="${INSTALL_DIR}/lib64:${INSTALL_DIR}/lib:${LD_LIBRARY_PATH:-}"
+          export DYLD_LIBRARY_PATH="${INSTALL_DIR}/lib64:${INSTALL_DIR}/lib:${DYLD_LIBRARY_PATH:-}"
+          "${INSTALL_DIR}/bin/openssl" version
 
       - name: Check (Windows)
         if: matrix.target.platform == 'windows'
