@@ -291,6 +291,11 @@ jobs:
         with:
           tag_name: openssl-${{ matrix.version }}
           name: OpenSSL ${{ matrix.version }}
+          # Never let an individual matrix build claim the "latest" flag. Builds run
+          # in parallel and finish in a non-deterministic order, so whichever release
+          # happened to be created last would otherwise win "latest" regardless of its
+          # version. The dedicated set-latest job below decides the real latest release.
+          make_latest: false
           body: |
             Built OpenSSL ${{ matrix.version }}
 
@@ -306,3 +311,48 @@ jobs:
             *Built automatically using GitHub Actions. The workflow source code is available [here](https://github.com/nercone-rear/openssl/blob/main/.github/workflows/build.yml).*
           files: dist/*
           fail_on_unmatched_files: true
+
+  set-latest:
+    needs: [check-version, release]
+    # Run whenever the release job did not fail, including runs where there was
+    # nothing new to build (release skipped). This keeps the "latest" pointer
+    # reconciled to the highest version on every run and self-heals if it ever
+    # drifts to an older release.
+    if: |
+      always() &&
+      needs.check-version.result == 'success' &&
+      needs.release.result != 'failure' &&
+      needs.release.result != 'cancelled'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Mark the highest version as the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Collect all published, semver-tagged OpenSSL releases in this repo.
+          mapfile -t VERSIONS < <(gh api "repos/${{ github.repository }}/releases" --paginate \
+            --jq '.[] | select(.draft == false and .prerelease == false) |
+                   select(.tag_name | test("^openssl-[0-9]+\\.[0-9]+\\.[0-9]+$")) |
+                   (.tag_name | sub("^openssl-";""))')
+
+          if [ "${#VERSIONS[@]}" -eq 0 ]; then
+            echo "No published OpenSSL releases found; nothing to reconcile."
+            exit 0
+          fi
+
+          # Highest version wins "latest" (numeric/version sort, not creation date).
+          HIGHEST=$(printf '%s\n' "${VERSIONS[@]}" | sort -V | tail -n1)
+          echo "Highest version: ${HIGHEST}"
+
+          CURRENT=$(gh release view --repo "${{ github.repository }}" \
+            --json tagName --jq '.tagName' 2>/dev/null || true)
+          echo "Current latest: ${CURRENT:-<none>}"
+
+          if [ "${CURRENT}" = "openssl-${HIGHEST}" ]; then
+            echo "Latest is already openssl-${HIGHEST}; nothing to do."
+          else
+            echo "Setting openssl-${HIGHEST} as the latest release."
+            gh release edit "openssl-${HIGHEST}" --repo "${{ github.repository }}" --latest
+          fi
