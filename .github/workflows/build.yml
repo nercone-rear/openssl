@@ -1,0 +1,305 @@
+name: Build and Release OpenSSL
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'OpenSSL Version (x.y.z)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-openssl
+  cancel-in-progress: false
+
+jobs:
+  check-version:
+    runs-on: ubuntu-24.04
+    outputs:
+      versions: ${{ steps.determine.outputs.versions }}
+      should_build: ${{ steps.determine.outputs.should_build }}
+    steps:
+      - name: Determine target OpenSSL versions
+        id: determine
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANUAL_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${MANUAL_VERSION}" ]; then
+            VERSIONS_JSON=$(jq -cn --arg v "${MANUAL_VERSION}" '[$v]')
+            echo "Manually Specified: OpenSSL ${MANUAL_VERSION}"
+          else
+            mapfile -t CANDIDATES < <(gh api repos/openssl/openssl/releases --paginate \
+              --jq '[.[] | select(.draft == false and .prerelease == false) |
+                     select(.tag_name | test("^openssl-[0-9]+\\.[0-9]+\\.[0-9]+$")) |
+                     (.tag_name | sub("^openssl-";""))
+                    ] | .[0:5][]')
+
+            if [ "${#CANDIDATES[@]}" -eq 0 ]; then
+              echo "Failed to retrieve OpenSSL releases" >&2
+              exit 1
+            fi
+
+            echo "Candidates: ${CANDIDATES[*]}"
+
+            TO_BUILD=()
+            for v in "${CANDIDATES[@]}"; do
+              if gh release view "v${v}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+                echo "Skipping as Already Built: OpenSSL ${v}"
+              else
+                TO_BUILD+=("${v}")
+                echo "Appended: OpenSSL ${v}"
+              fi
+            done
+
+            if [ "${#TO_BUILD[@]}" -eq 0 ]; then
+              VERSIONS_JSON="[]"
+            else
+              VERSIONS_JSON=$(printf '%s\n' "${TO_BUILD[@]}" | jq -R . | jq -sc .)
+            fi
+          fi
+
+          echo "Versions to build: ${VERSIONS_JSON}"
+          echo "versions=${VERSIONS_JSON}" >> "$GITHUB_OUTPUT"
+
+          if [ "${VERSIONS_JSON}" = "[]" ]; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check-version
+    if: needs.check-version.outputs.should_build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJson(needs.check-version.outputs.versions) }}
+        target:
+          - id: linux-x86_64
+            os: ubuntu-24.04
+            platform: linux
+            arch: x86_64
+            configure_target: linux-x86_64
+
+          - id: linux-aarch64
+            os: ubuntu-24.04-arm
+            platform: linux
+            arch: aarch64
+            configure_target: linux-aarch64
+
+          - id: macos-x86_64
+            os: macos-15-intel
+            platform: darwin
+            arch: x86_64
+            configure_target: darwin64-x86_64-cc
+
+          - id: macos-aarch64
+            os: macos-15
+            platform: darwin
+            arch: aarch64
+            configure_target: darwin64-arm64-cc
+
+          - id: windows-x86_64
+            os: windows-2025
+            platform: windows
+            arch: x86_64
+            configure_target: VC-WIN64A
+            msvc_arch: amd64
+
+          - id: windows-aarch64
+            os: windows-11-arm
+            platform: windows
+            arch: aarch64
+            configure_target: VC-WIN64-ARM
+            msvc_arch: arm64
+
+    runs-on: ${{ matrix.target.os }}
+    env:
+      OPENSSL_VERSION: ${{ matrix.version }}
+      DIST_NAME: openssl-${{ matrix.version }}-${{ matrix.target.platform }}-${{ matrix.target.arch }}
+
+    steps:
+      - name: Setup MSVC (Windows)
+        if: matrix.target.platform == 'windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.target.msvc_arch }}
+
+      - name: Setup NASM (Windows x86_64)
+        if: matrix.target.id == 'windows-x86_64'
+        uses: ilammy/setup-nasm@v1
+
+      - name: Download OpenSSL (Linux/macOS)
+        if: matrix.target.platform != 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL -o openssl-src.tar.gz \
+            "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+          mkdir src
+          tar -xzf openssl-src.tar.gz -C src --strip-components=1
+
+      - name: Download OpenSSL (Windows)
+        if: matrix.target.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "https://github.com/openssl/openssl/releases/download/openssl-$env:OPENSSL_VERSION/openssl-$env:OPENSSL_VERSION.tar.gz"
+          Invoke-WebRequest -Uri $url -OutFile openssl-src.tar.gz
+          New-Item -ItemType Directory -Path src | Out-Null
+          tar -xzf openssl-src.tar.gz -C src --strip-components=1
+
+      - name: Build OpenSSL (Linux/macOS)
+        if: matrix.target.platform != 'windows'
+        shell: bash
+        working-directory: src
+        run: |
+          set -euo pipefail
+
+          INSTALL_DIR="${{ github.workspace }}/${DIST_NAME}"
+
+          if [ "${{ matrix.target.platform }}" = "darwin" ]; then
+            JOBS=$(sysctl -n hw.logicalcpu)
+          else
+            JOBS=$(nproc)
+          fi
+
+          perl Configure "${{ matrix.target.configure_target }}" \
+            --prefix="${INSTALL_DIR}" \
+            --openssldir="${INSTALL_DIR}/ssl" \
+            no-tests
+
+          make -j"${JOBS}" build_sw
+          make install_sw install_ssldirs
+
+      - name: Build OpenSSL (Windows)
+        if: matrix.target.platform == 'windows'
+        shell: pwsh
+        working-directory: src
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installDir = "${{ github.workspace }}\$env:DIST_NAME" -replace '\\', '/'
+
+          perl Configure ${{ matrix.target.configure_target }} `
+            --prefix="$installDir" `
+            --openssldir="$installDir/ssl" `
+            no-tests
+          if ($LASTEXITCODE -ne 0) { throw "Configure failed" }
+
+          nmake build_sw
+          if ($LASTEXITCODE -ne 0) { throw "nmake build_sw failed" }
+
+          nmake install_sw install_ssldirs
+          if ($LASTEXITCODE -ne 0) { throw "nmake install_sw failed" }
+
+      - name: Check (Linux/macOS)
+        if: matrix.target.platform != 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${{ github.workspace }}/${DIST_NAME}/bin/openssl" version
+
+      - name: Check (Windows)
+        if: matrix.target.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          & "${{ github.workspace }}\$env:DIST_NAME\bin\openssl.exe" version
+
+      - name: Package (Linux/macOS)
+        if: matrix.target.platform != 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          zip -r -q "dist/${DIST_NAME}.zip" "${DIST_NAME}"
+          tar -czf "dist/${DIST_NAME}.tar.gz" "${DIST_NAME}"
+          tar -cJf "dist/${DIST_NAME}.tar.xz" "${DIST_NAME}"
+          7z a -bd -t7z "dist/${DIST_NAME}.7z" "${DIST_NAME}" >/dev/null
+
+      - name: Package (Windows)
+        if: matrix.target.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+
+          if (-not (Get-Command 7z -ErrorAction SilentlyContinue)) {
+            choco install 7zip -y --no-progress
+          }
+
+          $name = $env:DIST_NAME
+
+          7z a -tzip "dist/$name.zip" "$name" | Out-Null
+
+          7z a -ttar "dist/$name.tar" "$name" | Out-Null
+          7z a -tgzip "dist/$name.tar.gz" "dist/$name.tar" | Out-Null
+          7z a -txz "dist/$name.tar.xz" "dist/$name.tar" | Out-Null
+          Remove-Item "dist/$name.tar"
+
+          7z a -t7z "dist/$name.7z" "$name" | Out-Null
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: openssl-${{ matrix.version }}-${{ matrix.target.id }}
+          path: dist/*
+          retention-days: 1
+          if-no-files-found: error
+
+  release:
+    needs: [check-version, build]
+    if: needs.check-version.outputs.should_build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJson(needs.check-version.outputs.versions) }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download artifacts for this version
+        uses: actions/download-artifact@v4
+        with:
+          pattern: openssl-${{ matrix.version }}-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          files=(*)
+          sha256sum -- "${files[@]}" > SHA256SUMS
+          sha384sum -- "${files[@]}" > SHA384SUMS
+          sha512sum -- "${files[@]}" > SHA512SUMS
+
+      - name: List assets to be released
+        run: ls -la dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: openssl-${{ matrix.version }}
+          name: OpenSSL ${{ matrix.version }}
+          body: |
+            Built OpenSSL ${{ matrix.version }}
+
+            **Platforms / Architectures:**
+            - Linux (x86_64, AArch64)
+            - macOS (x86_64, AArch64)
+            - Windows (x86_64, AArch64)
+
+            Source: https://github.com/openssl/openssl/releases/tag/openssl-${{ matrix.version }}
+
+            SHA-256/384/512 checksums for all assets are provided in `SHA256SUMS`, `SHA384SUMS`, and `SHA512SUMS`.
+
+            *Built automatically using GitHub Actions. The workflow source code is available [here](https://github.com/nercone-rear/openssl/blob/main/.github/workflows/build.yml).*
+          files: dist/*
+          fail_on_unmatched_files: true
