@@ -51,7 +51,7 @@ jobs:
 
             TO_BUILD=()
             for v in "${CANDIDATES[@]}"; do
-              if gh release view "v${v}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+              if gh release view "openssl-${v}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
                 echo "Skipping as Already Built: OpenSSL ${v}"
               else
                 TO_BUILD+=("${v}")
