@@ -291,10 +291,6 @@ jobs:
         with:
           tag_name: openssl-${{ matrix.version }}
           name: OpenSSL ${{ matrix.version }}
-          # Never let an individual matrix build claim the "latest" flag. Builds run
-          # in parallel and finish in a non-deterministic order, so whichever release
-          # happened to be created last would otherwise win "latest" regardless of its
-          # version. The dedicated set-latest job below decides the real latest release.
           make_latest: false
           body: |
             Built OpenSSL ${{ matrix.version }}
@@ -314,10 +310,6 @@ jobs:
 
   set-latest:
     needs: [check-version, release]
-    # Run whenever the release job did not fail, including runs where there was
-    # nothing new to build (release skipped). This keeps the "latest" pointer
-    # reconciled to the highest version on every run and self-heals if it ever
-    # drifts to an older release.
     if: |
       always() &&
       needs.check-version.result == 'success' &&
@@ -331,7 +323,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Collect all published, semver-tagged OpenSSL releases in this repo.
           mapfile -t VERSIONS < <(gh api "repos/${{ github.repository }}/releases" --paginate \
             --jq '.[] | select(.draft == false and .prerelease == false) |
                    select(.tag_name | test("^openssl-[0-9]+\\.[0-9]+\\.[0-9]+$")) |
@@ -342,7 +333,6 @@ jobs:
             exit 0
           fi
 
-          # Highest version wins "latest" (numeric/version sort, not creation date).
           HIGHEST=$(printf '%s\n' "${VERSIONS[@]}" | sort -V | tail -n1)
           echo "Highest version: ${HIGHEST}"
 
