@@ -22,6 +22,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       versions: ${{ steps.determine.outputs.versions }}
+      versions_asc: ${{ steps.determine.outputs.versions_asc }}
       should_build: ${{ steps.determine.outputs.should_build }}
     steps:
       - name: Determine target OpenSSL versions
@@ -68,6 +69,10 @@ jobs:
 
           echo "Versions to build: ${VERSIONS_JSON}"
           echo "versions=${VERSIONS_JSON}" >> "$GITHUB_OUTPUT"
+
+          VERSIONS_ASC_JSON=$(jq -c 'sort_by(split(".") | map(tonumber))' <<< "${VERSIONS_JSON}")
+          echo "Versions ascending (for release order): ${VERSIONS_ASC_JSON}"
+          echo "versions_asc=${VERSIONS_ASC_JSON}" >> "$GITHUB_OUTPUT"
 
           if [ "${VERSIONS_JSON}" = "[]" ]; then
             echo "should_build=false" >> "$GITHUB_OUTPUT"
@@ -263,8 +268,9 @@ jobs:
     if: needs.check-version.outputs.should_build == 'true'
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
-        version: ${{ fromJson(needs.check-version.outputs.versions) }}
+        version: ${{ fromJson(needs.check-version.outputs.versions_asc) }}
     runs-on: ubuntu-24.04
     steps:
       - name: Download artifacts for this version
